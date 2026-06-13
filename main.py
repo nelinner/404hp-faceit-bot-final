@@ -1,4 +1,4 @@
-# main.py — 404hp FACEIT (с миграцией старых игроков)
+# main.py — 404hp FACEIT (ПОЛНЫЙ КОД, ВСЕ ФУНКЦИИ)
 import asyncio, logging, sqlite3, hashlib, secrets, random, os
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
@@ -15,9 +15,9 @@ PROJECT_NAME = "404hp FACEIT"
 CHANNEL_ID = "@hp404faceit"
 HEAD_ADMIN_USERNAME = "nelinner"
 DB_NAME = "faceit_data.db"
-OLD_DB_NAME = "404hp_faceit.db"   # имя старой базы (если есть)
+OLD_DB_NAME = "404hp_faceit.db"
 
-# Старые базы, которые можно смело удалить (уже не нужны)
+# Удаляем совсем старые базы (оставляем только актуальные)
 for f in ["404hp_faceit_v2.db", "database.db", "404hp_faceit_new.db"]:
     if os.path.exists(f):
         try: os.remove(f)
@@ -72,6 +72,7 @@ def create_tables(conn):
     c.execute("""CREATE TABLE IF NOT EXISTS bans (
         pid INT, till TEXT, reason TEXT, admin TEXT
     )""")
+    # добавляем недостающие столбцы, если таблицы уже существовали
     try: c.execute("ALTER TABLE rooms ADD COLUMN finished INTEGER DEFAULT 0")
     except sqlite3.OperationalError: pass
     try: c.execute("ALTER TABLE players ADD COLUMN prem_till TEXT")
@@ -209,13 +210,7 @@ async def update_lobby_post(room_id):
         [InlineKeyboardButton(text="🔰 ПРИСОЕДИНИТЬСЯ", callback_data=f"join_{room_id}")]
     ])
     try:
-        await bot.edit_message_text(
-            chat_id=CHANNEL_ID,
-            message_id=room['msg_id'],
-            text=text,
-            parse_mode="HTML",
-            reply_markup=kb
-        )
+        await bot.edit_message_text(chat_id=CHANNEL_ID, message_id=room['msg_id'], text=text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         print(f"Ошибка обновления поста: {e}")
 
@@ -244,7 +239,7 @@ async def start(msg: types.Message, state: FSMContext):
 # ---------- FSM ----------
 class Reg(StatesGroup): nick = State(); pw = State(); pw2 = State()
 class Lobby(StatesGroup): map = State(); confirm = State()
-class Result(StatesGroup): score = State()
+class Result(StatesGroup): photo = State(); score = State()
 class AdminFSM(StatesGroup): assign = State(); revoke = State(); prem = State(); ban_user = State(); ban_reason = State(); ban_dur = State(); unban_user = State()
 class Replace(StatesGroup): lobby = State(); old = State(); new = State(); confirm = State()
 
@@ -255,70 +250,40 @@ MAPS = {
     "prison":"🔒 Prison"
 }
 
-# ---------- РЕЗУЛЬТАТ (С ОБЯЗАТЕЛЬНЫМ СКРИНШОТОМ) ----------
-class Result(StatesGroup):
-    photo = State()
-    score = State()
+# ---------- РЕГИСТРАЦИЯ ----------
+@dp.message(Reg.nick)
+async def reg_nick(msg: types.Message, state: FSMContext):
+    nick = msg.text.strip()
+    if len(nick) < 3: await msg.answer_photo(REGISTRATION_IMAGE, caption="❌ Минимум 3 символа"); return
+    conn = get_db()
+    if conn.execute("SELECT 1 FROM players WHERE nick=?", (nick,)).fetchone():
+        await msg.answer_photo(REGISTRATION_IMAGE, caption="❌ Ник занят"); conn.close(); return
+    conn.close()
+    await state.update_data(n=nick)
+    await msg.answer_photo(REGISTRATION_IMAGE, caption="🔐 Придумайте пароль (мин. 6):")
+    await state.set_state(Reg.pw)
 
-@dp.message(Command("result"))
-async def result_start(msg: types.Message, state: FSMContext):
-    if not await is_admin(msg.from_user.id):
-        await msg.answer("❌ Только админ может регистрировать результат")
-        return
-    await msg.answer_photo(MAIN_MENU_IMAGE, caption="📸 Пожалуйста, отправьте скриншот результата матча.")
-    await state.set_state(Result.photo)
+@dp.message(Reg.pw)
+async def reg_pw(msg: types.Message, state: FSMContext):
+    pw = msg.text.strip()
+    if len(pw) < 6: await msg.answer_photo(REGISTRATION_IMAGE, caption="❌ Минимум 6 символов"); return
+    await state.update_data(p=pw)
+    await msg.answer_photo(REGISTRATION_IMAGE, caption="🔐 Повторите пароль:")
+    await state.set_state(Reg.pw2)
 
-@dp.message(Result.photo, F.photo)
-async def result_photo(msg: types.Message, state: FSMContext):
-    photo_id = msg.photo[-1].file_id
-    await state.update_data(photo=photo_id)
-    await msg.answer("📊 Теперь введите счёт матча в формате:\nCT T номер_лобби\nПример: 16 14 5")
-    await state.set_state(Result.score)
-
-@dp.message(Result.score)
-async def result_score(msg: types.Message, state: FSMContext):
-    try:
-        ct, t, rid = map(int, msg.text.split())
-        data = await state.get_data()
-        photo_id = data.get('photo')
-        conn = get_db()
-        teams = conn.execute("SELECT * FROM teams WHERE room=?", (rid,)).fetchall()
-        if len(teams) != 2:
-            await msg.answer("❌ Команды не найдены"); conn.close(); await state.clear(); return
-        ct_team = teams[0] if teams[0]['side']=='CT' else teams[1]
-        t_team = teams[1] if teams[0]['side']=='CT' else teams[0]
-        ct_pl = conn.execute("SELECT * FROM team_players WHERE team=? ORDER BY pos", (ct_team['id'],)).fetchall()
-        t_pl = conn.execute("SELECT * FROM team_players WHERE team=? ORDER BY pos", (t_team['id'],)).fetchall()
-        ct_won = ct > t
-        # обновление ELO...
-        for p in ct_pl:
-            u = conn.execute("SELECT * FROM players WHERE id=?", (p['pid'],)).fetchone()
-            if u:
-                ch = random.randint(15,35) if ct_won else random.randint(10,30)
-                ne = max(0, u['elo']+ch if ct_won else u['elo']-ch)
-                m, w, l = u['matches']+1, u['wins']+(1 if ct_won else 0), u['losses']+(0 if ct_won else 1)
-                conn.execute("UPDATE players SET elo=?, rank=?, matches=?, wins=?, losses=?, wr=? WHERE id=?", (ne, get_rank(ne), m, w, l, round(w/m*100,1), p['pid']))
-        for p in t_pl:
-            u = conn.execute("SELECT * FROM players WHERE id=?", (p['pid'],)).fetchone()
-            if u:
-                ch = random.randint(15,35) if not ct_won else random.randint(10,30)
-                ne = max(0, u['elo']+ch if not ct_won else u['elo']-ch)
-                m, w, l = u['matches']+1, u['wins']+(1 if not ct_won else 0), u['losses']+(0 if not ct_won else 1)
-                conn.execute("UPDATE players SET elo=?, rank=?, matches=?, wins=?, losses=?, wr=? WHERE id=?", (ne, get_rank(ne), m, w, l, round(w/m*100,1), p['pid']))
-        conn.execute("UPDATE rooms SET finished=1 WHERE id=?", (rid,))
-        conn.commit()
-        conn.close()
-        # формируем текст и отправляем в канал с фото
-        txt = f"📊 РЕЗУЛЬТАТ МАТЧА\nЛобби #{rid}\n🔵 CT: {ct}\n"
-        for p in ct_pl: txt += f"• {p['nick']}\n"
-        txt += f"\n🔴 T: {t}\n"
-        for p in t_pl: txt += f"• {p['nick']}\n"
-        txt += f"\n🏆 Победитель: {'CT' if ct_won else 'T'}"
-        await bot.send_photo(CHANNEL_ID, photo=photo_id, caption=txt)
-        await msg.answer("✅ Результаты сохранены и опубликованы со скриншотом!")
-        await state.clear()
-    except:
-        await msg.answer("❌ Формат: CT T номер_лобби")
+@dp.message(Reg.pw2)
+async def reg_pw2(msg: types.Message, state: FSMContext):
+    if msg.text.strip() != (await state.get_data())['p']:
+        await msg.answer_photo(REGISTRATION_IMAGE, caption="❌ Не совпадают"); await state.set_state(Reg.pw); return
+    data = await state.get_data()
+    h, s = hash_pw(data['p'])
+    role = 'director' if (msg.from_user.username or "").lower() == HEAD_ADMIN_USERNAME else 'player'
+    conn = get_db()
+    conn.execute("INSERT INTO players (id,nick,pw,salt,role,reg) VALUES (?,?,?,?,?,datetime('now'))",
+                 (msg.from_user.id, data['n'], h, s, role))
+    conn.commit(); conn.close()
+    await msg.answer_photo(REGISTRATION_IMAGE, caption=f"✅ Добро пожаловать, {data['n']}!\nРоль: {ROLE_NAMES[role]}\nELO: 0")
+    await state.clear()
 
 # ---------- ПОИСК МАТЧА ----------
 @dp.callback_query(lambda c: c.data == "find")
@@ -338,7 +303,7 @@ async def find_match(cb: types.CallbackQuery):
     kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back")])
     await bot.send_message(cb.from_user.id, "🎮 Доступные лобби:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-# ---------- СОЗДАНИЕ ЛОББИ (ИСПРАВЛЕНО) ----------
+# ---------- СОЗДАНИЕ ЛОББИ ----------
 @dp.callback_query(lambda c: c.data == "lobby")
 async def create_lobby(cb: types.CallbackQuery, state: FSMContext):
     kb = [[InlineKeyboardButton(text=v, callback_data=f"map_{k}")] for k,v in MAPS.items()]
@@ -403,8 +368,7 @@ async def join_lobby(cb: types.CallbackQuery):
     n = r['now'] + 1
     conn.execute("INSERT INTO room_players VALUES (?,?,?,?,?)", (rid, uid, p['nick'], p['role'], n))
     conn.execute("UPDATE rooms SET now=? WHERE id=?", (n, rid))
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     await update_lobby_post(rid)
     await cb.answer(f"✅ Вы присоединились ({n}/10)", show_alert=True)
     if n >= 10:
@@ -450,17 +414,26 @@ async def draw(msg: types.Message):
         print(f"Ошибка в draw: {e}")
         await msg.answer("❌ Ошибка при жеребьёвке")
 
-# ---------- РЕЗУЛЬТАТ ----------
+# ---------- РЕЗУЛЬТАТ (С ОБЯЗАТЕЛЬНЫМ СКРИНШОТОМ) ----------
 @dp.message(Command("result"))
-async def result(msg: types.Message, state: FSMContext):
+async def result_start(msg: types.Message, state: FSMContext):
     if not await is_admin(msg.from_user.id): await msg.answer("❌ Только админ"); return
-    await msg.answer("📊 Введите счёт: CT T номер_лобби\nПример: 16 14 5")
+    await msg.answer_photo(MAIN_MENU_IMAGE, caption="📸 Пожалуйста, отправьте скриншот результата матча.")
+    await state.set_state(Result.photo)
+
+@dp.message(Result.photo, F.photo)
+async def result_photo(msg: types.Message, state: FSMContext):
+    photo_id = msg.photo[-1].file_id
+    await state.update_data(photo=photo_id)
+    await msg.answer("📊 Теперь введите счёт матча в формате:\nCT T номер_лобби\nПример: 16 14 5")
     await state.set_state(Result.score)
 
 @dp.message(Result.score)
 async def result_score(msg: types.Message, state: FSMContext):
     try:
         ct, t, rid = map(int, msg.text.split())
+        data = await state.get_data()
+        photo_id = data.get('photo')
         conn = get_db()
         teams = conn.execute("SELECT * FROM teams WHERE room=?", (rid,)).fetchall()
         if len(teams) != 2: await msg.answer("❌ Команды не найдены"); conn.close(); await state.clear(); return
@@ -490,10 +463,11 @@ async def result_score(msg: types.Message, state: FSMContext):
         txt += f"\n🔴 T: {t}\n"
         for p in t_pl: txt += f"• {p['nick']}\n"
         txt += f"\n🏆 Победитель: {'CT' if ct_won else 'T'}"
-        await bot.send_message(CHANNEL_ID, txt)
-        await msg.answer("✅ Результаты сохранены!")
+        await bot.send_photo(CHANNEL_ID, photo=photo_id, caption=txt)
+        await msg.answer("✅ Результаты сохранены и опубликованы со скриншотом!")
         await state.clear()
-    except: await msg.answer("❌ Формат: CT T номер_лобби")
+    except:
+        await msg.answer("❌ Формат: CT T номер_лобби")
 
 # ---------- ПРОФИЛЬ ----------
 @dp.callback_query(lambda c: c.data == "profile")
@@ -750,7 +724,7 @@ async def back(cb: types.CallbackQuery):
 # ---------- ЗАПУСК ----------
 async def main():
     init_db()
-    print(f"🔥 {PROJECT_NAME} ЗАПУЩЕН! Все функции активны")
+    print(f"🔥 {PROJECT_NAME} ЗАПУЩЕН!")
     while True:
         try: await dp.start_polling(bot)
         except Exception as e:
@@ -758,4 +732,4 @@ async def main():
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    asyncio.run(main())                
+    asyncio.run(main())
