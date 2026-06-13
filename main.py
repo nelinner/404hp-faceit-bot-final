@@ -255,40 +255,70 @@ MAPS = {
     "prison":"🔒 Prison"
 }
 
-# ---------- РЕГИСТРАЦИЯ ----------
-@dp.message(Reg.nick)
-async def reg_nick(msg: types.Message, state: FSMContext):
-    nick = msg.text.strip()
-    if len(nick) < 3: await msg.answer_photo(REGISTRATION_IMAGE, caption="❌ Минимум 3 символа"); return
-    conn = get_db()
-    if conn.execute("SELECT 1 FROM players WHERE nick=?", (nick,)).fetchone():
-        await msg.answer_photo(REGISTRATION_IMAGE, caption="❌ Ник занят"); conn.close(); return
-    conn.close()
-    await state.update_data(n=nick)
-    await msg.answer_photo(REGISTRATION_IMAGE, caption="🔐 Придумайте пароль (мин. 6):")
-    await state.set_state(Reg.pw)
+# ---------- РЕЗУЛЬТАТ (С ОБЯЗАТЕЛЬНЫМ СКРИНШОТОМ) ----------
+class Result(StatesGroup):
+    photo = State()
+    score = State()
 
-@dp.message(Reg.pw)
-async def reg_pw(msg: types.Message, state: FSMContext):
-    pw = msg.text.strip()
-    if len(pw) < 6: await msg.answer_photo(REGISTRATION_IMAGE, caption="❌ Минимум 6 символов"); return
-    await state.update_data(p=pw)
-    await msg.answer_photo(REGISTRATION_IMAGE, caption="🔐 Повторите пароль:")
-    await state.set_state(Reg.pw2)
+@dp.message(Command("result"))
+async def result_start(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
+        await msg.answer("❌ Только админ может регистрировать результат")
+        return
+    await msg.answer_photo(MAIN_MENU_IMAGE, caption="📸 Пожалуйста, отправьте скриншот результата матча.")
+    await state.set_state(Result.photo)
 
-@dp.message(Reg.pw2)
-async def reg_pw2(msg: types.Message, state: FSMContext):
-    if msg.text.strip() != (await state.get_data())['p']:
-        await msg.answer_photo(REGISTRATION_IMAGE, caption="❌ Не совпадают"); await state.set_state(Reg.pw); return
-    data = await state.get_data()
-    h, s = hash_pw(data['p'])
-    role = 'director' if (msg.from_user.username or "").lower() == HEAD_ADMIN_USERNAME else 'player'
-    conn = get_db()
-    conn.execute("INSERT INTO players (id,nick,pw,salt,role,reg) VALUES (?,?,?,?,?,datetime('now'))",
-                 (msg.from_user.id, data['n'], h, s, role))
-    conn.commit(); conn.close()
-    await msg.answer_photo(REGISTRATION_IMAGE, caption=f"✅ Добро пожаловать, {data['n']}!\nРоль: {ROLE_NAMES[role]}\nELO: 0")
-    await state.clear()
+@dp.message(Result.photo, F.photo)
+async def result_photo(msg: types.Message, state: FSMContext):
+    photo_id = msg.photo[-1].file_id
+    await state.update_data(photo=photo_id)
+    await msg.answer("📊 Теперь введите счёт матча в формате:\nCT T номер_лобби\nПример: 16 14 5")
+    await state.set_state(Result.score)
+
+@dp.message(Result.score)
+async def result_score(msg: types.Message, state: FSMContext):
+    try:
+        ct, t, rid = map(int, msg.text.split())
+        data = await state.get_data()
+        photo_id = data.get('photo')
+        conn = get_db()
+        teams = conn.execute("SELECT * FROM teams WHERE room=?", (rid,)).fetchall()
+        if len(teams) != 2:
+            await msg.answer("❌ Команды не найдены"); conn.close(); await state.clear(); return
+        ct_team = teams[0] if teams[0]['side']=='CT' else teams[1]
+        t_team = teams[1] if teams[0]['side']=='CT' else teams[0]
+        ct_pl = conn.execute("SELECT * FROM team_players WHERE team=? ORDER BY pos", (ct_team['id'],)).fetchall()
+        t_pl = conn.execute("SELECT * FROM team_players WHERE team=? ORDER BY pos", (t_team['id'],)).fetchall()
+        ct_won = ct > t
+        # обновление ELO...
+        for p in ct_pl:
+            u = conn.execute("SELECT * FROM players WHERE id=?", (p['pid'],)).fetchone()
+            if u:
+                ch = random.randint(15,35) if ct_won else random.randint(10,30)
+                ne = max(0, u['elo']+ch if ct_won else u['elo']-ch)
+                m, w, l = u['matches']+1, u['wins']+(1 if ct_won else 0), u['losses']+(0 if ct_won else 1)
+                conn.execute("UPDATE players SET elo=?, rank=?, matches=?, wins=?, losses=?, wr=? WHERE id=?", (ne, get_rank(ne), m, w, l, round(w/m*100,1), p['pid']))
+        for p in t_pl:
+            u = conn.execute("SELECT * FROM players WHERE id=?", (p['pid'],)).fetchone()
+            if u:
+                ch = random.randint(15,35) if not ct_won else random.randint(10,30)
+                ne = max(0, u['elo']+ch if not ct_won else u['elo']-ch)
+                m, w, l = u['matches']+1, u['wins']+(1 if not ct_won else 0), u['losses']+(0 if not ct_won else 1)
+                conn.execute("UPDATE players SET elo=?, rank=?, matches=?, wins=?, losses=?, wr=? WHERE id=?", (ne, get_rank(ne), m, w, l, round(w/m*100,1), p['pid']))
+        conn.execute("UPDATE rooms SET finished=1 WHERE id=?", (rid,))
+        conn.commit()
+        conn.close()
+        # формируем текст и отправляем в канал с фото
+        txt = f"📊 РЕЗУЛЬТАТ МАТЧА\nЛобби #{rid}\n🔵 CT: {ct}\n"
+        for p in ct_pl: txt += f"• {p['nick']}\n"
+        txt += f"\n🔴 T: {t}\n"
+        for p in t_pl: txt += f"• {p['nick']}\n"
+        txt += f"\n🏆 Победитель: {'CT' if ct_won else 'T'}"
+        await bot.send_photo(CHANNEL_ID, photo=photo_id, caption=txt)
+        await msg.answer("✅ Результаты сохранены и опубликованы со скриншотом!")
+        await state.clear()
+    except:
+        await msg.answer("❌ Формат: CT T номер_лобби")
 
 # ---------- ПОИСК МАТЧА ----------
 @dp.callback_query(lambda c: c.data == "find")
